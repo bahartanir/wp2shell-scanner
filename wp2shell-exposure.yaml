@@ -1,0 +1,49 @@
+id: wp2shell-batch-exposure
+
+info:
+  name: WordPress wp2shell Exposure (CVE-2026-63030, CVE-2026-60137)
+  author: zephrsec
+  severity: critical
+  reference:
+    - https://slcyber.io/research-center/wp2shell-pre-authentication-rce-in-wordpress-core/
+  classification:
+    cve-id: CVE-2026-63030,CVE-2026-60137
+  tags: wordpress,cve2026,rce,sqli,wp2shell
+
+http:
+  - raw:
+      - |
+        GET / HTTP/1.1
+        Host: {{Hostname}}
+      - |
+        POST /?rest_route=/batch/v1 HTTP/1.1
+        Host: {{Hostname}}
+        Content-Type: application/json
+
+        {}
+
+    req-condition: true
+    redirects: true
+
+    extractors:
+      - type: regex
+        name: wp_version
+        part: body_1
+        group: 1
+        regex:
+          - 'name="generator" content="WordPress ([0-9.]+)"'
+
+    matchers-condition: and
+    matchers:
+      - type: dsl
+        dsl:
+          - >-
+            compare_versions(wp_version, ">=6.9.0", "<6.9.5") ||
+            compare_versions(wp_version, ">=7.0.0", "<7.0.2") ||
+            compare_versions(wp_version, ">=6.8.0", "<6.8.6")
+      - type: word
+        part: body_2
+        words:
+          - '"rest_missing_callback_param"'
+          - '"rest_invalid_param"'
+        condition: or
