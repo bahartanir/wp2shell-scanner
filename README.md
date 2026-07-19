@@ -1,5 +1,9 @@
 # wp2shell-scanner
 
+> **by [@bahartanir](https://github.com/bahartanir) (katherinepierce)**
+> Fork of [ZephrFish/wp2shell-scanner](https://github.com/ZephrFish/wp2shell-scanner) with additional improvements.
+> Research by Adam Kues (Assetnote) and Mustafa Can İPEKÇİ (nukedx).
+
 Detection and validation tooling for WordPress core exposure to wp2shell
 (CVE-2026-63030 / CVE-2026-60137). Modes are selected with a flag, and the
 target is positional. `--scan` fingerprints the core version and confirms the
@@ -8,7 +12,7 @@ REST `/batch/v1` route is reachable without sending an exploit payload; the
 PoC for authorized lab use.
 
 `wp2shell.py` is a single, standard-library-only script — no external
-dependencies. Every invocation prints a **ZephrSec** banner to stderr before it
+dependencies. Every invocation prints the banner to stderr before it
 runs (it stays off stdout, so `--scan -j` JSON output is unaffected).
 
 ## Command flags
@@ -65,7 +69,7 @@ wp2shell.py (--scan | --check | --read | --shell | --rce | --root-prereq)
 | `--authorized` | `--rce` | Assert authorization for a non-loopback `--rce` target (required for remote hosts). |
 | `--timeout` | all | Per-request timeout in seconds (default 15). |
 
-Deep dive blog post: https://blog.zsec.uk/wp2shell-code-trace-deep-dive/
+Original deep dive: https://blog.zsec.uk/wp2shell-code-trace-deep-dive/
 
 ## Nuclei template
 

@@ -2,48 +2,88 @@ id: wp2shell-batch-exposure
 
 info:
   name: WordPress wp2shell Exposure (CVE-2026-63030, CVE-2026-60137)
-  author: zephrsec
+  author: bahartanir
   severity: critical
+  description: |
+    WordPress REST /batch/v1 route confusion leads to pre-auth blind SQLi (CVE-2026-60137)
+    and unauthenticated RCE via admin forge + webshell upload (CVE-2026-63030).
+    Affects WP 6.8.x < 6.8.6, 6.9.x < 6.9.5, 7.0.x < 7.0.2.
   reference:
     - https://slcyber.io/research-center/wp2shell-pre-authentication-rce-in-wordpress-core/
+  metadata:
+    verified: true
+    max-request: 3
   classification:
-    cve-id: CVE-2026-63030,CVE-2026-60137
-  tags: wordpress,cve2026,rce,sqli,wp2shell
+    cve-id:
+      - CVE-2026-63030
+      - CVE-2026-60137
+  tags: wordpress,cve-2026,rce,sqli,wp2shell,pre-auth
 
 http:
   - raw:
+      # Request 1: homepage — generator meta tag
       - |
         GET / HTTP/1.1
         Host: {{Hostname}}
+        User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
+
+      # Request 2: RSS feed — more reliable version source, present even when
+      # generator meta tag is removed via remove_action('wp_head','wp_generator')
+      - |
+        GET /feed/ HTTP/1.1
+        Host: {{Hostname}}
+        User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
+
+      # Request 3: batch route probe — empty JSON triggers rest_missing_callback_param
+      # if the /batch/v1 route is registered (i.e. vulnerable WP version is running)
       - |
         POST /?rest_route=/batch/v1 HTTP/1.1
         Host: {{Hostname}}
         Content-Type: application/json
+        User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 
         {}
 
     req-condition: true
     redirects: true
+    max-redirects: 3
 
     extractors:
+      # Primary version source: <meta name="generator" content="WordPress X.Y.Z">
       - type: regex
         name: wp_version
         part: body_1
         group: 1
         regex:
-          - 'name="generator" content="WordPress ([0-9.]+(?:-[0-9A-Za-z.-]+)?)"'
+          - 'name="generator" content="WordPress ([0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-[0-9A-Za-z.-]+)?)"'
+
+      # Fallback version source: RSS <generator>https://wordpress.org/?v=X.Y.Z</generator>
+      # Works on sites that stripped the generator meta tag from <head>
+      - type: regex
+        name: wp_version_feed
+        part: body_2
+        group: 1
+        regex:
+          - 'wordpress\.org/\?v=([0-9]+\.[0-9]+(?:\.[0-9]+)?)'
 
     matchers-condition: and
     matchers:
+      # At least one version source must resolve to a vulnerable range
       - type: dsl
         dsl:
           - >-
+            compare_versions(wp_version, ">=6.8.0", "<6.8.6") ||
             compare_versions(wp_version, ">=6.9.0", "<6.9.5") ||
             compare_versions(wp_version, ">=7.0.0", "<7.0.2") ||
-            compare_versions(wp_version, ">=6.8.0", "<6.8.6") ||
-            regex("^7[.]1-(alpha|beta1)", wp_version)
+            regex("^7\\.1-(alpha|beta1)$", wp_version) ||
+            compare_versions(wp_version_feed, ">=6.8.0", "<6.8.6") ||
+            compare_versions(wp_version_feed, ">=6.9.0", "<6.9.5") ||
+            compare_versions(wp_version_feed, ">=7.0.0", "<7.0.2") ||
+            regex("^7\\.1-(alpha|beta1)$", wp_version_feed)
+
+      # Batch route must be live and return the expected REST validation error
       - type: word
-        part: body_2
+        part: body_3
         words:
           - '"rest_missing_callback_param"'
           - '"rest_invalid_param"'

