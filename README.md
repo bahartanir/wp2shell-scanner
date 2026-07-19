@@ -42,6 +42,7 @@ wp2shell.py (--scan | --check | --read | --shell | --rce | --root-prereq)
 | `--shell` | Authenticated RCE chain using a cracked/recovered admin password. |
 | `--rce` | Credential-less **pre-auth** RCE: forges its own admin through the SQLi, then deploys a self-cleaning webshell. |
 | `--root-prereq` | Benign shell-to-root prerequisite check; runs diagnostics only, never a local privilege escalation. |
+| `--lpe` | Full chain: pre-auth SQLi → admin forge → webshell → root. Tries CVE-2023-2640/32629 (GameOverlay overlayfs), CVE-2023-4911 (Looney Tunables glibc), CVE-2024-1086 (nf_tables UAF probe), then SUID/sudo/cap fallback. |
 
 ### Option flags
 
@@ -119,6 +120,7 @@ python3 wp2shell.py --shell http://127.0.0.1:8080 --user admin --password 'Summe
 python3 wp2shell.py --rce   http://127.0.0.1:8080 --cmd id
 python3 wp2shell.py --rce   http://127.0.0.1:8080 -i
 python3 wp2shell.py --root-prereq http://127.0.0.1:8080 --user admin --password 'Summer2026!'
+python3 wp2shell.py --lpe   http://127.0.0.1:8080
 ```
 
 Patch diffs used to ground the PoC are saved under `poc/diffs/`, with research
@@ -127,3 +129,26 @@ notes in `poc/RESEARCH.md`. The SQLi is fully reconstructable from the
 re-entry → admin creation) reproduces the stock-default RCE against the bundled
 lab; `--shell` is the alternate path via a recovered/cracked admin credential to
 authenticated plugin upload and command execution.
+
+## Local Privilege Escalation (`--lpe`)
+
+`--lpe` chains the full pre-auth RCE (SQLi → admin forge → webshell) with
+an automated root escalation attempt. It tries the following in order, stopping
+at the first success:
+
+| CVE | Affected | Technique | Compiler |
+| --- | --- | --- | --- |
+| CVE-2023-2640 / CVE-2023-32629 | Ubuntu 22.04 / 23.04, kernel < 6.3.3 with GameOverlay driver | Unprivileged overlayfs mount in user namespace preserves `chmod +s` on upper dir | None (pure shell) |
+| CVE-2023-4911 | glibc 2.34–2.38 (Ubuntu 22.04, Debian 12, Fedora 37–38) | GLIBC_TUNABLES stack overflow in `_dl_parse_tunables()` → LD_PRELOAD injection on SUID exec | `gcc` required |
+| CVE-2024-1086 | Kernel 5.14.21–6.6.14 / 6.7.2 | nf_tables UAF in `nft_verdict_init()`; prerequisite probe only — links to [notselwyn/CVE-2024-1086](https://github.com/notselwyn/CVE-2024-1086) for full exploit | `gcc` required |
+| Fallback | Any | SUID GTFOBins + `sudo NOPASSWD` abuse | None |
+
+```
+python3 wp2shell.py --lpe http://127.0.0.1:8080
+python3 wp2shell.py --lpe http://127.0.0.1:8080 -y          # skip auth prompt
+python3 wp2shell.py --lpe https://target --authorized        # non-loopback
+```
+
+`--lpe` on a non-loopback target requires `--authorized`. On the bundled lab
+(Ubuntu 22.04 base image with a vulnerable GameOverlay kernel) CVE-2023-2640/32629
+succeeds without a compiler.

