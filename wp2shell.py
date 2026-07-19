@@ -86,6 +86,14 @@ class _KeepPost(urllib.request.HTTPRedirectHandler):
 # ==========================================================================
 # scan — non-destructive exposure check (version fingerprint + batch route)
 # ==========================================================================
+def _ssl_ctx():
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
 def http(url, method="GET", data=None):
     headers = {
         "User-Agent": UA,
@@ -98,7 +106,7 @@ def http(url, method="GET", data=None):
         headers["Content-Type"] = "application/json"
     req = request.Request(url, method=method, data=data, headers=headers)
     try:
-        with request.urlopen(req, timeout=TIMEOUT) as r:
+        with request.urlopen(req, timeout=TIMEOUT, context=_ssl_ctx()) as r:
             return r.status, r.read(100000).decode("utf-8", "replace")
     except error.HTTPError as e:
         body = e.read(100000).decode("utf-8", "replace") if e.fp else ""
@@ -230,7 +238,7 @@ class BlindSQLi:
             self.url, data=data,
             headers={"Content-Type": "application/json"}, method="POST")
         start = time.perf_counter()
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+        with urllib.request.urlopen(req, timeout=self.timeout, context=_ssl_ctx()) as resp:
             resp.read()
         return time.perf_counter() - start
 
