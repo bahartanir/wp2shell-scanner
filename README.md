@@ -42,7 +42,7 @@ wp2shell.py (--scan | --check | --read | --shell | --rce | --root-prereq)
 | `--shell` | Authenticated RCE chain using a cracked/recovered admin password. |
 | `--rce` | Credential-less **pre-auth** RCE: forges its own admin through the SQLi, then deploys a self-cleaning webshell. |
 | `--root-prereq` | Benign shell-to-root prerequisite check; runs diagnostics only, never a local privilege escalation. |
-| `--lpe` | Full chain: pre-auth SQLi → admin forge → webshell → root. Tries CVE-2023-2640/32629 (GameOverlay overlayfs), CVE-2023-4911 (Looney Tunables glibc), CVE-2024-1086 (nf_tables UAF probe), then SUID/sudo/cap fallback. |
+| `--lpe` | Full chain: pre-auth SQLi → admin forge → webshell → root. Tries CVE-2023-2640/32629 (GameOverlay overlayfs), CVE-2023-4911 (Looney Tunables glibc), CVE-2026-31431 (AF_ALG Copy Fail), CVE-2026-23111 (nf_tables UAF probe), then SUID/sudo/cap fallback. |
 
 ### Option flags
 
@@ -140,7 +140,8 @@ at the first success:
 | --- | --- | --- | --- |
 | CVE-2023-2640 / CVE-2023-32629 | Ubuntu 22.04 / 23.04, kernel < 6.3.3 with GameOverlay driver | Unprivileged overlayfs mount in user namespace preserves `chmod +s` on upper dir | None (pure shell) |
 | CVE-2023-4911 | glibc 2.34–2.38 (Ubuntu 22.04, Debian 12, Fedora 37–38) | GLIBC_TUNABLES stack overflow in `_dl_parse_tunables()` → LD_PRELOAD injection on SUID exec | `gcc` required |
-| CVE-2024-1086 | Kernel 5.14.21–6.6.14 / 6.7.2 | nf_tables UAF in `nft_verdict_init()`; prerequisite probe only — links to [notselwyn/CVE-2024-1086](https://github.com/notselwyn/CVE-2024-1086) for full exploit | `gcc` required |
+| CVE-2026-31431 | Linux kernel with `algif_aead` + `authencesn(hmac(sha256),cbc(aes))` | AF_ALG AEAD in-place optimisation + `splice()` writes 4 bytes into SUID binary page cache; prerequisite probe — links to [AliHzSec/CVE-2026-31431](https://github.com/AliHzSec/CVE-2026-31431) | `gcc` required |
+| CVE-2026-23111 | Ubuntu 22.04 / 24.04, Debian Bookworm / Trixie | nf_tables inverted check UAF in `nft_map_catchall_activate()` → `chain->use` underflow → freed chain; prerequisite probe — links to [Baba01hacker666/CVE-2026-23111](https://github.com/Baba01hacker666/CVE-2026-23111) | `gcc` required |
 | Fallback | Any | SUID GTFOBins + `sudo NOPASSWD` abuse | None |
 
 ```
